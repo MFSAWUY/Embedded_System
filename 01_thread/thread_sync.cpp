@@ -5,9 +5,10 @@
 //        1. mutex 保证同一时刻只有一个线程访问临界区，即共享资源
 //        2. condition_variable 让线程“等待某个条件成立”，而不是空转轮询，用于线程间的等待和通知
 //        3. wait(lock, pred) 的语义：
-//             1) 如果 pred() 返回 false：自动释放锁并挂起；线程进入等待状态，直到被 notify 唤醒，被唤醒后重新获取锁并检查 pred()，如果 pred() 仍然返回 false，则继续等待
+//             1) 如果 pred() 返回 false：自动释放锁并等待；通知或虚假唤醒后重新加锁、检查条件，不满足则继续等待
 //             2) 如果 pred() 返回 true：立即返回（已持锁），线程继续执行，不会进入等待状态
-//        4. notify_one() 唤醒一个等待线程，notify_all() 唤醒所有等待线程
+//        4. 两类等待者共用一个条件变量，因此使用 notify_all()，由各自的谓词判断能否继续
+#include <cstddef>
 #include <iostream>
 #include <thread>
 #include <mutex>
@@ -18,7 +19,7 @@
 std::queue<int> q;                               // 共享数据（队列）
 std::mutex mtx;                                  // 互斥锁，保护共享数据，保护队列的锁
 std::condition_variable cv;                      // 条件变量，用于线程间的等待和通知
-constexpr int MAX_QUEUE_SIZE = 5;                // 队列容量上限
+constexpr std::size_t MAX_QUEUE_SIZE = 5;         // 队列容量上限
 
 // 生产者线程函数：生产数据并放入队列，队列满时阻塞
 void producer(int id) {
@@ -45,8 +46,8 @@ void consumer(int id) {
 
         int value = q.front();
         q.pop();
-        lock.unlock();
-        std::cout << "[Consumer " << id << "]: pop " << value 
+        // size() 也是共享访问，必须持锁；整行日志留在锁内便于观察每次操作。
+        std::cout << "[Consumer " << id << "]: pop " << value
                   << ", size=" << q.size() << std::endl;
         
         lock.unlock();

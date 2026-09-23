@@ -1,50 +1,147 @@
-// pipe_ipc.cpp -- 管道：IPC（进程间通信）
+// pipe_ipc.cpp -- 匿名管道：父进程写，子进程读
 // 编译：g++ -std=c++17 pipe_ipc.cpp -o pipe_ipc
+// 运行：./pipe_ipc [message]，无参数时发送默认消息；空字符串也是有效消息。
 //
-// 学习重点：
-//        1. pipe(fd) 是一种“半双工”的通信方式，数据只能单向流动：fd[0] 用于读，fd[1] 用于写，数据从 fd[1] 写入，从 fd[0] 读取
-//        2. 管道本质是一个内核中的缓冲区，进程通过 read() 和 write() 操作管道，写入的数据从另一端按顺序读出
-//        3. 管道只能在具有公共祖先的进程间使用，通常是父子进程，即进程见内存是隔离的，想通信必须借助内核提供的机制（管道/共享内存/信号等）
-//        4. 管道有容量限制，当管道满时，write() 会阻塞；当管道空时，read() 会阻塞
-//        5. 常见用法：父进程创建管道，fork() 创建子进程，父进程写入数据，子进程读取数据，即 fork 后父子进程各管一端，一个写一个读
+// pipefd[0] 是读端，pipefd[1] 是写端；本例通过 fork 继承这两个文件描述符。
+// 管道是字节流，没有消息边界；一次 write 不一定对应一次 read。
+// 阻塞模式下，空管道仍有写端时 read 等待；所有写端关闭且数据读完才返回 EOF。
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <iostream>
-#include <cstring>      // strlen()
-#include <unistd.h>     // pipe(), read(), write()
-#include <sys/wait.h>   // waitpid()
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
-int main() {
-    int pipefd[2]; // 管道文件描述符数组
+namespace {
 
-    if (pipe(pipefd) <= 0) {
-        perror("pipe");
+bool close_fd(int fd) {
+    if (close(fd) == -1) {
+        std::perror("close");
+        // Linux 即使在 close 返回 EINTR 时也已释放描述符，不要重试关闭。
+        return false;
+    }
+    return true;
+}
+
+bool write_all(int fd, const char* message, std::size_t length) {
+    std::size_t offset = 0;
+    while (offset < length) {
+        const ssize_t written = write(fd, message + offset, length - offset);
+        if (written > 0) {
+            offset += static_cast<std::size_t>(written);
+        } else if (written == -1 && errno == EINTR) {
+            continue;
+        } else {
+            if (written == -1) {
+                std::perror("write");
+            } else {
+                std::cerr << "write: no progress" << std::endl;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    if (argc > 2) {
+        std::cerr << "Usage: " << argv[0] << " [message]" << std::endl;
+        return 2;
+    }
+    const char* message = argc == 2 ? argv[1] : "Hello from parent process!";
+
+    // 读端意外关闭时，让 write 返回 EPIPE，便于报告错误并回收子进程。
+    struct sigaction action {};
+    action.sa_handler = SIG_IGN;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGPIPE, &action, nullptr) == -1) {
+        std::perror("sigaction");
         return 1;
     }
 
-    pid_t pid = fork();
-
-    if (pid == 0) {
-        // ---- 子进程：读 ----
-        close(pipefd[1]); // 关闭自己已用不到的写端
-
-        char buffer[128];
-        ssize_t bytes_read = read(pipefd[0], buffer, sizeof(buffer));
-        while (bytes_read > 0) {
-            buffer[bytes_read] = '\0'; // 确保字符串以 '\0' 结尾
-            std::cout << "[Child] received: " << buffer << std::endl;
-        }
-
-        close(pipefd[0]); // 关闭读端
-    } else {
-        // ---- 父进程 ----
-        close(pipefd[0]); // 关闭读端
-
-        const char* message = "Hello from parent process!";
-        write(pipefd[1], message, strlen(message));
-
-        close(pipefd[1]); // 关闭写端后，子进程才能读到 EOF(0)，read() 才会返回 0
-
-        waitpid(pid, nullptr, 0); // 等待子进程结束
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        std::perror("pipe");
+        return 1;
     }
 
-    return 0;
+    const pid_t pid = fork();
+    if (pid == -1) {
+        std::perror("fork");
+        close_fd(pipefd[0]);
+        close_fd(pipefd[1]);
+        return 1;
+    }
+
+    if (pid == 0) {
+        // 子进程不写入，必须关闭它继承的写端，否则自己也会阻止 EOF。
+        if (!close_fd(pipefd[1])) {
+            close_fd(pipefd[0]);
+            return 1;
+        }
+
+        int exit_code = 0;
+        char buffer[128];
+        std::cout << "[Child] received: ";
+        for (;;) {
+            const ssize_t received = read(pipefd[0], buffer, sizeof(buffer));
+            if (received > 0) {
+                // 按长度输出，读满 128 字节也不需要额外写入 '\0'。
+                std::cout.write(buffer, static_cast<std::streamsize>(received));
+                if (!std::cout) {
+                    std::cerr << "stdout: output failed" << std::endl;
+                    exit_code = 1;
+                    break;
+                }
+            } else if (received == 0) {
+                std::cout << std::endl;
+                if (!std::cout) {
+                    std::cerr << "stdout: output failed" << std::endl;
+                    exit_code = 1;
+                }
+                break;
+            } else if (errno != EINTR) {
+                std::perror("read");
+                exit_code = 1;
+                break;
+            }
+        }
+        if (!close_fd(pipefd[0])) {
+            exit_code = 1;
+        }
+        return exit_code;
+    }
+
+    int exit_code = close_fd(pipefd[0]) ? 0 : 1;
+    if (!write_all(pipefd[1], message, std::strlen(message))) {
+        exit_code = 1;
+    }
+    // 必须先关闭写端再 waitpid，否则子进程可能在等 EOF，而父进程在等子进程。
+    if (!close_fd(pipefd[1])) {
+        exit_code = 1;
+    }
+
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited == -1 && errno == EINTR);
+
+    if (waited == -1) {
+        std::perror("waitpid");
+        return 1;
+    }
+    if (WIFEXITED(status)) {
+        return exit_code != 0 ? exit_code : WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        const int signal_number = WTERMSIG(status);
+        std::cerr << "[Parent] child terminated by signal= " << signal_number << std::endl;
+        return 128 + signal_number;
+    }
+    std::cerr << "[Parent] unexpected child status" << std::endl;
+    return 1;
 }

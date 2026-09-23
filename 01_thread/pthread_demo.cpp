@@ -1,44 +1,68 @@
-// pthread_demo.cpp -- POSIX 线程底层 API
+// pthread_demo.cpp -- POSIX 线程：参数、返回值和错误处理
 // 编译：g++ -std=c++17 pthread_demo.cpp -o pthread_demo -pthread
 //
-// 学习重点：
-//        1.std::thread 底层就是封装了 pthread， 学习这个能看清线程的本质
-//        2.线程函数签名固定为 void* (*)(void*), 也就是返回值为 void*，参数为 void* 的函数指针，参数/返回值都靠 void* 来传递
-//        3.pthread_create() 创建线程，pthread_join() 等待线程结束并回收资源、获取线程返回值
+// std::thread 是跨平台标准接口；pthread 是本例直接使用的 POSIX 接口。
+// 入口函数的签名固定为 void* (*)(void*)，可通过指针传递一个结构体。
+// pthread_create/pthread_join 直接返回错误编号，不能用 errno 代替它。
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <pthread.h>
 #include <unistd.h>
 
-// 线程入口函数：必须返回 void*，参数也为 void*，参数/返回值都靠 void* 来传递（使用 pthread 创建线程入口函数参数固定）
-void* worker(void* arg){
-    int id = *(int*)arg;                        // 传入的参数是 void*，需要强制类型转换为 int*，再解引用获取值，从 void* 里取出参数
-    std::cout << "pthread " << id << " running, tid="
-              << pthread_self() << std::endl;   // pthread_self() 获取线程 ID
-    sleep(1); // 模拟线程工作，休眠 1 秒
-    return (void*)(long)(id * 100);             // 返回值也为 void*，这里返回 id*100，强制类型转换为 void*
+struct ThreadData {
+    int id;
+    int result;
+};
+
+void* worker(void* arg) {
+    auto* data = static_cast<ThreadData*>(arg);
+    // pthread_t 是不透明类型，不能跨平台假定它是可打印的整数。
+    std::cout << "pthread " << data->id << " running" << std::endl;
+    sleep(1);  // 仅模拟工作耗时，不用于同步。
+    data->result = data->id * 100;
+    return data;  // 返回 main 中仍然存活的结构体地址，不把整数伪装成指针。
 }
 
 int main() {
-    std::cout << "Main thread id: " << pthread_self() << std::endl;
+    constexpr int THREAD_COUNT = 2;
+    pthread_t threads[THREAD_COUNT]{};
+    ThreadData data[THREAD_COUNT]{{1, 0}, {2, 0}};
+    ThreadData* results[THREAD_COUNT]{};
+    int created = 0;
+    int exit_code = EXIT_SUCCESS;
 
-    pthread_t t1, t2; // 线程 ID
-    int arg1 = 1, arg2 = 2; // 线程参数
+    for (int i = 0; i < THREAD_COUNT; ++i) {
+        const int error = pthread_create(&threads[i], nullptr, worker, &data[i]);
+        if (error != 0) {
+            std::cerr << "pthread_create: " << std::strerror(error) << std::endl;
+            exit_code = EXIT_FAILURE;
+            break;
+        }
+        ++created;
+    }
 
-    // 创建两个线程，分别执行 worker 函数，传递函数 + 参数
-    // 参数：线程句柄 / 属性（默认 nullptr）/ 线程入口函数 / 线程入口函数参数
-    pthread_create(&t1, nullptr, worker, &arg1); // 创建线程 t1，执行 worker(&arg1)
-    pthread_create(&t2, nullptr, worker, &arg2); // 创建线程 t2，执行 worker(&arg2)
+    // 即使后续创建失败，也要等待已经启动的线程，保证 data 的生命周期。
+    for (int i = 0; i < created; ++i) {
+        void* returned = nullptr;
+        const int error = pthread_join(threads[i], &returned);
+        if (error != 0) {
+            std::cerr << "pthread_join: " << std::strerror(error) << std::endl;
+            // 无法确认线程已结束时，不能销毁它仍可能访问的栈上参数。
+            // 诊断已刷新，直接结束整个进程；pthread_join 不返回 EINTR。
+            std::_Exit(EXIT_FAILURE);
+        }
+        results[i] = static_cast<ThreadData*>(returned);
+    }
 
-    // pthread_join 阻塞当前线程，等待指定线程结束，并通过第二参数获取返回值
-    void* ret1;
-    void* ret2;
-    // join 阻塞当前线程，等待指定线程结束，并获取返回值
-    pthread_join(t1, &ret1); // 等待线程 t1 结束，并获取返回值
-    pthread_join(t2, &ret2); // 等待线程 t2 结束，并获取返回值
+    if (exit_code != EXIT_SUCCESS) {
+        return exit_code;
+    }
 
-    std::cout << "Thread " << arg1 << " returned: " << (long)ret1
-              << ", Thread " << arg2 << " returned: " << (long)ret2 << std::endl;
-
+    // join 建立同步关系；这里读取工作线程写入的 result 无需额外的锁。
+    std::cout << "Thread " << results[0]->id << " returned: " << results[0]->result
+              << ", Thread " << results[1]->id << " returned: " << results[1]->result
+              << std::endl;
     std::cout << "All threads finished." << std::endl;
-    return 0;
+    return EXIT_SUCCESS;
 }
